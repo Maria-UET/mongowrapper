@@ -1,8 +1,8 @@
-
 from bson.binary import Binary
 from bson.objectid import ObjectId
 import gridfs
 import pymongo
+from pymongo.read_preferences import ReadPreference
 import pickle
 import numpy as np
 import datetime
@@ -75,7 +75,12 @@ class MongoWrapper(object):
     # If you want to connect to a remote host, pass in 
     # 'hostname' and 'port' values to these functions (see documentation).    
 
-    db = mdb.MongoWrapper('test','test_collection') 
+    db = mdb.MongoWrapper(db = mdb.MongoWrapper(db_name='test',
+                              collection_name=['test_clxn0', 'test_clxn1'],
+                              hostname='localhost',
+                              username='alexbw',
+                              password='1',
+                              port=27017)) 
     objectID = db.save(dictionary)
 
     # some varient here.  use the meta data to filter.
@@ -103,21 +108,20 @@ class MongoWrapper(object):
     'leaks' through rounds of processing on data.  Care should be taken to 
     duplicate data when needed.
     """
-    def __init__(self, db_name, collection_name, hostname='localhost', port=27017, username="alexbw", password=""):
+    def __init__(self, db_name, collection_names, hostname='localhost', port=27017, username="alexbw", password="1"):
         self.db_name = db_name
-        self.collection_name = collection_name
+        self.collection_names = collection_names # list of collections in the db e.g. ['test'] or ['test_clxn0', 'test_clxn1']
         self.hostname = hostname
         self.port = port
 
-        self.connection = pymongo.Connection(hostname, port)
-        if (username != ""):
-            admin_db = self.connection["admin"]
-            admin_db = admin_db.authenticate(username, password)
-
+        self.connection = pymongo.MongoClient(hostname, port, username=username, password=password)
         self.db = self.connection[self.db_name]
         self.fs = gridfs.GridFS(self.db)
-
-        self.collection = self.db[collection_name]
+        
+        # Support for db with multiple collections
+        self.collections=list()
+        for clxn_name in collection_names: 
+            self.collections.append(self.db[clxn_name])
 
     def _close(self):
         self.connection.close()
@@ -125,11 +129,11 @@ class MongoWrapper(object):
     def __del__(self):
         self._close()
 
+
     # core methods.  load(), save(), delete()
 
-    def save(self, document):
+    def save(self, document, clxn_num=0, has_arrays=True):
         """Stores a dictionary or list of dictionaries as as a document in collection.
-        The collection is specified in the initialization of the object.
 
         Note that if the dictionary has an '_id' field, and a document in the
         collection as the same '_id' key-value pair, that object will be
@@ -139,6 +143,8 @@ class MongoWrapper(object):
         object- the method will check for old gridfs objects and delete them. 
 
         :param: document: dictionary of arbitrary size and structure, can contain numpy arrays. Can also be a list of such objects.
+                clxn_num: index of the collection in the collections list, as specified in the initialization of the object.
+                has_arrays: True if the document contains numpy arrays which need to be stored through gridFS.
         :returns: List of ObjectIds of the inserted object(s).
         """
 
@@ -147,46 +153,53 @@ class MongoWrapper(object):
             document = [document]
 
         id_values = []
-        for doc in document:
+        if has_arrays: # if the document has numpy arrays, save the document with gridFS
+            for doc in document:
 
-            docCopy = copy.deepcopy(doc)
+                docCopy = copy.deepcopy(doc)
 
-            # make a list of any existing referenced gridfs files
-            try:
-                self.temp_oldNpObjectIDs = docCopy['_npObjectIDs']
-            except KeyError:
+                # make a list of any existing referenced gridfs files
+                try:
+                    self.temp_oldNpObjectIDs = docCopy['_npObjectIDs']
+                except KeyError:
+                    self.temp_oldNpObjectIDs = []
+
+                self.temp_newNpObjectIds = []
+                # replace np arrays with either a new gridfs file or a reference to the old gridfs file
+                docCopy = self._stashNPArrays(docCopy)
+
+                docCopy['_npObjectIDs'] = self.temp_newNpObjectIds
+                doc['_npObjectIDs'] = self.temp_newNpObjectIds
+
+                # cleanup any remaining gridfs files (these used to be pointed to by document, but no
+                # longer match any np.array that was in the db
+                for id in self.temp_oldNpObjectIDs:
+                    # print 'deleting obj %s' % id
+                    self.fs.delete(id)
                 self.temp_oldNpObjectIDs = []
 
-            self.temp_newNpObjectIds = []
-            # replace np arrays with either a new gridfs file or a reference to the old gridfs file
-            docCopy = self._stashNPArrays(docCopy)
+                # add insertion date field to every document
+                docCopy['insertion_date'] = datetime.datetime.now()
+                doc['insertion_date'] = datetime.datetime.now()
 
-            docCopy['_npObjectIDs'] = self.temp_newNpObjectIds
-            doc['_npObjectIDs'] = self.temp_newNpObjectIds
-            
-            # cleanup any remaining gridfs files (these used to be pointed to by document, but no
-            # longer match any np.array that was in the db
-            for id in self.temp_oldNpObjectIDs:
-                # print 'deleting obj %s' % id
-                self.fs.delete(id)
-            self.temp_oldNpObjectIDs = []
-
-            # add insertion date field to every document
-            docCopy['insertion_date'] = datetime.datetime.now()
-            doc['insertion_date'] = datetime.datetime.now()
-            
-            # insert into the collection and restore full data into original document object
-            new_id = self.collection.save(docCopy)
-            doc['_id'] = new_id
+                # insert into the collection and restore full data into original document object
+                new_id = self.collections[clxn_num].save(docCopy)
+                doc['_id'] = new_id
+                id_values.append(new_id)
+        else: # if the document does not have numpy arrays, save the document without gridFS
+            new_id = self.collections[clxn_num].save(document[0])
+            document[0]['_id'] = new_id
             id_values.append(new_id)
 
         return id_values
 
-    def loadFromIds(self, Ids):
+    def loadFromIds(self, Ids, clxn_num=0, has_arrays=True): 
         """Conveience function to load from a list of ObjectIds or from their string
         representations.  Takes a singleton or a list of either type.
-
+h
         :param Ids: can be an ObjectId, string representation of an ObjectId, or a list containing items of either type.
+               clxn_num: index of the collection in the collections list, as specified in the initialization of the object.
+               has_arrays: True if the document contains numpy arrays which have been stored through gridFS.
         :returns: List of documents from the DB.  If a document w/the object did not exist, a None object is returned instead.
         """
         if type(Ids) is not list:
@@ -202,38 +215,87 @@ class MongoWrapper(object):
                     obj_id = ObjectId(id)
                 except:
                     obj_id = id
-            out.append(self.load({'_id':obj_id}))
+            out.append(self.load({'_id':obj_id}, clxn_num, has_arrays))
 
         return out
     
-    def load(self, query, getarrays=True):
+    def load(self,  query, clxn_num=0, has_arrays=True):
         """Preforms a search using the presented query. For examples, see:
         See http://api.mongodb.org/python/2.0/tutorial.html
         The basic idea is to send in a dictionaries which key-value pairs like
         mdb.load({'basename':'ag022012'}).
 
-        :param query: dictionary of key-value pairs to use for querying the mongodb
+        :param: query: dictionary of key-value pairs to use for querying the mongodb
+                clxn_num: index of the collection in the collections list, as specified in the initialization of the object.
+                has_arrays: True if the document contains numpy arrays which have been stored through gridFS.
+        :returns: List of full documents from the collection
+        """
+
+        results = self.collections[clxn_num].find(query)
+
+        if has_arrays: # return the numpy array after reading it through gridFS
+            allResults = [self._loadNPArrays(doc) for doc in results]
+        else: # return the objectIds of the numpy array
+            allResults = [doc for doc in results]
+
+        return allResults
+
+    def loadAll(self, clxn_num=0,  has_arrays=True):
+        """returns all the documents in the collection
+
+        :param: query: dictionary of key-value pairs to use for querying the mongodb
+                clxn_num: index of the collection in the collections list, as specified in the initialization of the object.
+                has_arrays: True if the document contains numpy arrays which have been stored through gridFS.
         :returns: List of full documents from the collection
         """
         
-        results = self.collection.find(query)
+        results = self.collections[clxn_num].find()
         
-        if getarrays:
+        if has_arrays: # return the numpy array after reading it through gridFS
             allResults = [self._loadNPArrays(doc) for doc in results]
-        else:
+        else: # return the objectIds of the numpy array
             allResults = [doc for doc in results]
-        
-        if allResults:
-            if len(allResults) > 1:
-                return allResults
-            elif len(allResults) == 1:
-                return allResults[0]
-            else:
-                return None
-        else:
-            return None
 
-    def delete(self, objectId):
+        return allResults
+
+
+    def loadDistinct(self, key_list, clxn_num=0):
+        """
+        find all distinct values of the specified key in the collection. NOT SUPPORTED for Numpy arrays.
+        the distinct function of mongodb provides distinct values of a single key. 
+        See https://docs.mongodb.com/manual/reference/method/db.collection.distinct/ 
+        This function provides distinct values against multiple keys.
+
+	For example, if the inventory collection that contains the following documents
+		{ "_id": 1, "dept": "A", "sizes": "M" }
+		{ "_id": 2, "dept": "A", "sizes": "S" }
+		{ "_id": 3, "dept": "B", "sizes": "S" }
+		{ "_id": 4, "dept": "A", "sizes": "S" }
+
+        loadDistinct(key_list=["dept"]):
+		[{"dept":"A"},
+		 {"dept":"B"}]
+        loadDistinct(key_list=["dept","sizes"]):
+		[{"dept":"A", "sizes": "M"},
+                 {"dept":"A", "sizes": "S"},
+                 {"dept":"B", "sizes": "S"}]
+
+
+        :param: key_list: list containing the names of keys
+                clxn_num: index of the collection in the collections list, as specified in the initialization of the object
+        :return: list of all distinct values of the set of keys in the collection
+        """
+        keys=dict()
+        for i in key_list:
+            keys[i] = 1
+
+        # *** check if the key exists in the db?
+        results = self.collections[clxn_num].find({}, keys)
+        allResults = [doc for doc in results]
+
+        return allResults
+
+    def delete(self, query, clxn_num, has_arrays=True):
         """Deletes a specific document from the collection based on the objectId.
         Note that it first deletes all the gridFS files pointed to by ObjectIds
         within the document.
@@ -241,13 +303,25 @@ class MongoWrapper(object):
         Use with caution, clearly.
 
         :param objectId: an id of an object in the database.
+               clxn_num: index of the collection in the collections list, as specified in the initialization of the object.
         """
         # *** Add confirmation?
-        documentToDelete= self.collection.find_one({"_id": objectId})
-        npObjectIdsToDelete = documentToDelete['_npObjectIDs']
-        for npObjectID in npObjectIdsToDelete:
-            self.fs.delete(npObjectID)
-        self.collection.remove(objectId)
+        object_id = self.collections[clxn_num].find_one(query)['_id']
+        documentToDelete= self.collections[clxn_num].find_one({"_id": object_id}) # for example {"_id": objectId}
+        
+        if has_arrays: # first deletes all the gridFS files pointed to by ObjectIds
+            npObjectIdsToDelete = documentToDelete['_npObjectIDs']
+            for npObjectID in npObjectIdsToDelete:
+                self.fs.delete(npObjectID)
+        self.collections[clxn_num].remove({"_id": ObjectId(object_id)})
+
+    def deleteCollection(self, clxn_num):
+        """Deletes an entire collection from the db
+
+           :param: clxn_num: index of the collection in the collections list, as specified in the initialization of the object.
+        """
+        self.collections[clxn_num].remove({})
+
 
     # utility functions
 
